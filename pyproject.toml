@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "custodychain"
+version = "0.1.0"
+description = "Tamper-evident chain of custody for digital evidence: Merkle-hashed exhibits, signed hash-chained log, RFC 3161 anchors and an independent verifier."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Sahil Singhi" }]
+keywords = ["dfir", "forensics", "chain-of-custody", "merkle-tree", "rfc3161", "rfc9162", "ed25519"]
+dependencies = [
+  "cryptography>=42",
+  "typer>=0.12",
+  "rich>=13",
+  "reportlab>=4",
+]
+
+[project.optional-dependencies]
+blake3 = ["blake3>=0.4"]
+ewf = ["libewf-python"]
+dev = ["pytest>=8", "hypothesis>=6", "blake3>=0.4"]
+demo = ["pillow>=10"]
+
+[project.scripts]
+custody = "custodychain.cli:main"
+custody-verify = "custodyverify.cli:main"
+
+[tool.setuptools]
+packages = ["custodychain", "custodyverify"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["slow: multi-GB evidence tests (run with -m slow)"]
+addopts = "-m 'not slow'"
