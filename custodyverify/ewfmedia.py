@@ -2,6 +2,10 @@
 
 Walks the section chain, takes the chunk table, inflates zlib chunks and
 checks Adler-32 on stored ones. Yields media bytes in fixed-size blocks.
+
+The container is untrusted input: the section chain must move forward (a
+pointer back to an earlier section would loop forever), and no chunk may
+inflate beyond the volume's chunk size (a decompression bomb).
 """
 
 from __future__ import annotations
@@ -12,6 +16,7 @@ from pathlib import Path
 from typing import Iterator
 
 MAGIC = b"EVF\t\r\n\xff\x00"
+MAX_CHUNK_SIZE = 64 << 20  # EnCase writes 32 KiB; anything near this is not a real image
 
 
 class E01Error(Exception):
@@ -71,13 +76,29 @@ def read_layout(first: Path) -> dict:
                     md5 = f.read(16).hex()
                 if kind == b"done" or nxt in (pos, 0):
                     break
+                if nxt < pos + 76 or nxt >= data_len:
+                    raise E01Error(f"{seg.name}: section at {pos} points to {nxt}; the section chain must move "
+                                   "forward inside the file (looping or truncated container)")
                 pos = nxt
             for i, (off, comp) in enumerate(table):
                 end = table[i + 1][0] if i + 1 < len(table) else sectors_end
                 chunks.append((seg, off, end - off, comp))
     if not chunks:
         raise E01Error("no chunk table")
+    if not 0 < chunk_size <= MAX_CHUNK_SIZE:
+        raise E01Error(f"implausible chunk size {chunk_size} bytes in the volume section")
     return {"chunks": chunks, "media_size": media_size, "chunk_size": chunk_size, "md5": md5, "sha1": sha1}
+
+
+def _inflate(raw: bytes, limit: int, where: str) -> bytes:
+    d = zlib.decompressobj()
+    try:
+        data = d.decompress(raw, limit + 1)
+    except zlib.error as exc:
+        raise E01Error(f"{where} does not inflate: {exc}") from exc
+    if len(data) > limit or d.unconsumed_tail:
+        raise E01Error(f"{where} inflates beyond the {limit}-byte chunk size (decompression bomb or corrupt table)")
+    return data
 
 
 def media_blocks(first: Path, block: int) -> Iterator[bytes]:
@@ -92,7 +113,7 @@ def media_blocks(first: Path, block: int) -> Iterator[bytes]:
             fh.seek(off)
             raw = fh.read(length)
             if comp:
-                data = zlib.decompress(raw)
+                data = _inflate(raw, layout["chunk_size"], f"{seg.name}: chunk at {off}")
             else:
                 data = raw[:-4]
                 if zlib.adler32(data) & 0xFFFFFFFF != struct.unpack("<I", raw[-4:])[0]:

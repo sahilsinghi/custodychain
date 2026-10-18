@@ -60,7 +60,9 @@ custody-verify ─► recompute leaves ─► check chain + signatures + roster 
 Plus: compromised-key windows, revoked keys, non-admin key management, forged witness
 co-signatures, future-dated and backdated entries, leaf-cache tampering, genesis pinning,
 E01 container damage, crash/resume, and a guarantee that the verifier never modifies the
-case file. **48 tests** in ~11 s, plus the slow multi-GB tests.
+case file. Hostile-input tests cover looping and decompression-bomb E01 containers, forged
+revocations, absurd chunk sizes and a case read while the writer still has it open.
+**55 tests** in ~11 s, plus the slow multi-GB test.
 
 Verified against the real world, not just against itself:
 * Merkle code in both packages matches Certificate Transparency's published test vectors.
@@ -145,6 +147,12 @@ Three of those design answers in short:
   multi-segment EnCase-style images and is cross-checked against libewf.
 * The BSA s.63 annex is a draft data sheet, not legal advice: confirm the prescribed format
   with your lab's legal team.
+
+## Security
+
+The verifier treats the case file, evidence, E01 containers and tokens as hostile input. Hardening,
+the signature-verification guarantees and the known limits (offline revocation, minimal path
+validation, genesis pinning) are listed in [SECURITY.md](SECURITY.md).
 
 ## Licence
 

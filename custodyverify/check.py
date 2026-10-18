@@ -39,6 +39,7 @@ DOMAIN_ENTRY = b"custodychain/v1/entry\x00"
 DOMAIN_WITNESS = b"custodychain/v1/witness\x00"
 ZERO = "00" * 32
 TIME_TOLERANCE = timedelta(minutes=5)
+MIN_CHUNK, MAX_CHUNK = 512, 1 << 30  # a signed chunk size outside this range is not something the writer produces
 
 
 def canonical(value: Any) -> bytes:
@@ -123,7 +124,13 @@ class CaseVerifier:
             if src.exists():
                 shutil.copy2(src, tmp / (self.db_path.name + suffix))
                 hashes[src.name] = hashlib.sha256(src.read_bytes()).hexdigest()
-        conn = sqlite3.connect(tmp / self.db_path.name)
+        # The case file is untrusted input: open the copy read-only, with SQLite's defensive mode
+        # on and schema-defined functions/virtual tables untrusted.
+        conn = sqlite3.connect(f"file:{tmp / self.db_path.name}?mode=ro", uri=True)
+        if hasattr(conn, "setconfig") and hasattr(sqlite3, "SQLITE_DBCONFIG_DEFENSIVE"):
+            conn.setconfig(sqlite3.SQLITE_DBCONFIG_DEFENSIVE, True)
+            conn.setconfig(sqlite3.SQLITE_DBCONFIG_TRUSTED_SCHEMA, False)
+        conn.execute("PRAGMA trusted_schema = OFF")
         return conn, hashes, tmp
 
     def run(self) -> dict:
@@ -223,21 +230,30 @@ class CaseVerifier:
         self.checks.append(c)
 
     def _check_signatures(self) -> list[dict]:
+        # A revocation can be logged after the fact with an earlier compromise point, which
+        # invalidates entries signed before the revocation itself. Only revocations that carry a
+        # valid admin signature may do that, so evaluate, collect markers from verified
+        # revocations, and re-evaluate until the set of markers stops changing.
+        compromised: dict[str, int] = {}
+        for _ in range(8):
+            c, entries, roster, markers = self._signature_pass(compromised)
+            if markers == compromised:
+                break
+            compromised = markers
+        self.entries_out.extend(entries)
+        self.checks.append(c)
+        return roster
+
+    def _signature_pass(self, compromised: dict[str, int]) -> tuple[Check, list[dict], list[dict], dict[str, int]]:
         c = Check("signatures", "Analyst signatures, key roster and witness co-signatures")
         roster: dict[str, dict] = {}
-        compromised: dict[str, int] = {}
-        # Revocations can be logged after the fact with an earlier compromise point.
-        for row in self.rows:
-            body = row.body or {}
-            if body.get("action") == "key_revoke":
-                d = body.get("details") or {}
-                if d.get("compromised_since_seq") is not None:
-                    compromised[d.get("key_id")] = int(d["compromised_since_seq"])
+        markers: dict[str, int] = {}
+        entries: list[dict] = []
         ok_count = 0
         for row in self.rows:
             body = row.body
             entry = {"seq": row.seq, "signature": "invalid"}
-            self.entries_out.append(entry)
+            entries.append(entry)
             if body is None:
                 continue
             entry.update({
@@ -296,9 +312,10 @@ class CaseVerifier:
                 roster[d["key_id"]]["revoked_seq"] = row.seq
                 roster[d["key_id"]]["revocation"] = {"reason": d.get("reason"),
                                                      "compromised_since_seq": d.get("compromised_since_seq")}
+                if d.get("compromised_since_seq") is not None:
+                    markers[d["key_id"]] = int(d["compromised_since_seq"])
         c.detail = f"{ok_count}/{len(self.rows)} entries carry a valid signature from an active roster key"
-        self.checks.append(c)
-        return [{k: v for k, v in m.items() if k != "raw"} for m in roster.values()]
+        return c, entries, [{k: v for k, v in m.items() if k != "raw"} for m in roster.values()], markers
 
     def _check_witness(self, row: Row, witness: dict | None, roster: dict, c: Check) -> bool:
         if not witness:
@@ -401,6 +418,9 @@ class CaseVerifier:
 
     def _rehash(self, c: Check, info: dict, ex: dict, path: Path, cached: list[bytes] | None, h, signed_root: bytes) -> None:
         chunk = int(ex.get("chunk_size", 4 << 20))
+        if not MIN_CHUNK <= chunk <= MAX_CHUNK:
+            c.fail(f"recorded chunk size {chunk} is outside {MIN_CHUNK}..{MAX_CHUNK} bytes; refusing to re-hash")
+            return
         fresh: list[bytes] = []
         sha256, md5, sha1 = hashlib.sha256(), hashlib.md5(), hashlib.sha1()
         total = 0
@@ -408,8 +428,12 @@ class CaseVerifier:
             c.fail(f"evidence file {path} not found")
             return
         if ewfmedia.looks_like_e01(path):
+            try:
+                layout = ewfmedia.read_layout(path)
+            except ewfmedia.E01Error as exc:
+                c.fail(f"E01 container is damaged: {exc}")
+                return
             blocks = ewfmedia.media_blocks(path, chunk)
-            layout = ewfmedia.read_layout(path)
         else:
             def file_blocks():
                 with open(path, "rb") as fh:

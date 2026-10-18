@@ -267,6 +267,8 @@ def ec_point(curve: Curve, data: bytes) -> tuple[int, int] | None:
             y = curve.p - y
     else:
         return None
+    if not (0 <= x < curve.p and 0 <= y < curve.p):  # reject non-canonical coordinate encodings
+        return None
     if (y * y - (pow(x, 3, curve.p) + curve.a * x + curve.b)) % curve.p != 0:
         return None
     return (x, y)

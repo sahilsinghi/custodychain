@@ -14,6 +14,7 @@ N entries or on demand) because free TSAs rate-limit.
 from __future__ import annotations
 
 import os
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime
@@ -105,15 +106,22 @@ def check_token(token: bytes, digest: bytes, nonce: int | None) -> tuple[datetim
     return gen_time, serial, token_nonce, policy
 
 
+MAX_RESPONSE = 1 << 20  # real TSA responses are a few KiB
+
+
 def request_token(url: str, digest: bytes, name: str = "", timeout: int = 30) -> Token:
+    if urllib.parse.urlsplit(url).scheme not in ("http", "https"):
+        raise TimestampError(f"{name or url}: TSA URL must be http(s)")
     nonce = int.from_bytes(os.urandom(8), "big") >> 1
     req = urllib.request.Request(
         url, data=build_request(digest, nonce), method="POST",
         headers={"Content-Type": "application/timestamp-query", "User-Agent": "custodychain/0.1"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - configured TSA URL
-            body = resp.read()
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310  # nosec B310 - http(s) only, checked above
+            body = resp.read(MAX_RESPONSE + 1)
+        if len(body) > MAX_RESPONSE:
+            raise TimestampError(f"{name or url}: response larger than {MAX_RESPONSE} bytes")
     except OSError as exc:
         raise TimestampError(f"{name or url}: {exc}") from exc
     token = parse_response(body)

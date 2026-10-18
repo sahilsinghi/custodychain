@@ -31,6 +31,22 @@ BYTES_PER_SECTOR = 512
 DEFAULT_SECTORS_PER_CHUNK = 64  # 32 KiB chunks, EnCase default
 
 
+MAX_CHUNK_SIZE = 64 << 20  # EnCase writes 32 KiB chunks; refuse absurd values from a crafted volume section
+MAX_HEADER_SIZE = 1 << 20
+
+
+def _inflate(raw: bytes, limit: int, where: str) -> bytes:
+    """zlib-inflate at most ``limit`` bytes; more means a corrupt table or a decompression bomb."""
+    d = zlib.decompressobj()
+    try:
+        data = d.decompress(raw, limit + 1)
+    except zlib.error as exc:
+        raise EwfError(f"{where} does not inflate: {exc}") from exc
+    if len(data) > limit or d.unconsumed_tail:
+        raise EwfError(f"{where} inflates beyond {limit} bytes (decompression bomb or corrupt chunk table)")
+    return data
+
+
 class EwfError(Exception):
     pass
 
@@ -172,7 +188,7 @@ class EwfImage:
                 fh.seek(off)
                 raw = fh.read(length)
                 if compressed:
-                    data = zlib.decompress(raw)
+                    data = _inflate(raw, self.chunk_size, f"chunk at segment {seg} offset {off}")
                 else:
                     data, stored = raw[:-4], raw[-4:]
                     if struct.unpack("<I", stored)[0] != _adler(data):
@@ -205,8 +221,8 @@ def segment_paths(first: Path) -> list[Path]:
 
 def _parse_header(raw: bytes) -> dict[str, str]:
     try:
-        text = zlib.decompress(raw).decode("utf-8", "replace")
-    except zlib.error:
+        text = _inflate(raw, MAX_HEADER_SIZE, "header section").decode("utf-8", "replace")
+    except EwfError:
         return {}
     lines = text.replace("\r", "").split("\n")
     if len(lines) < 4:
@@ -249,7 +265,7 @@ def open_e01(first: Path) -> EwfImage:
                 next_off, size = struct.unpack("<QQ", desc[16:32])
                 data_off = offset + SECTION_DESCRIPTOR_SIZE
                 if kind in ("header", "header2") and not header:
-                    header = _parse_header(fh.read(size - SECTION_DESCRIPTOR_SIZE))
+                    header = _parse_header(fh.read(max(0, min(size - SECTION_DESCRIPTOR_SIZE, MAX_HEADER_SIZE))))
                 elif kind in ("volume", "disk"):
                     vol = fh.read(1052)
                     _, spc, bps, n_sectors = struct.unpack_from("<IIIQ", vol, 4)
@@ -272,12 +288,17 @@ def open_e01(first: Path) -> EwfImage:
                     md5 = md5 or (data.hex() if any(data) else None)
                 if kind == "done" or next_off == offset or next_off == 0:
                     break
+                if next_off < offset + SECTION_DESCRIPTOR_SIZE or next_off >= file_size:
+                    raise EwfError(f"{path}: section at {offset} points to {next_off}; the section chain must move "
+                                   "forward inside the file (looping or truncated container)")
                 offset = next_off
             for i, (off, compressed) in enumerate(seg_chunk_offsets):
                 end = seg_chunk_offsets[i + 1][0] if i + 1 < len(seg_chunk_offsets) else sectors_end
                 chunks.append((seg_index, off, end - off, compressed))
     if not chunk_size or not chunks:
         raise EwfError(f"{first}: no volume or table section found")
+    if chunk_size > MAX_CHUNK_SIZE:
+        raise EwfError(f"{first}: implausible chunk size {chunk_size} bytes in the volume section")
     return EwfImage(paths, media_size, chunk_size, chunks, md5, sha1, header)
 
 
